@@ -6,6 +6,22 @@ export type EIP1193Provider = {
   removeListener?: (event: string, listener: (value: unknown) => void) => void;
 };
 
+export type EIP6963ProviderInfo = { uuid: string; name: string; icon: string; rdns: string };
+export type EIP6963ProviderDetail = { info: EIP6963ProviderInfo; provider: EIP1193Provider };
+
+export async function discoverEIP6963Providers(timeoutMs = 250): Promise<EIP6963ProviderDetail[]> {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") return [];
+  const found = new Map<string, EIP6963ProviderDetail>();
+  const onAnnouncement = (event: Event) => {
+    const detail = (event as CustomEvent<EIP6963ProviderDetail>).detail;
+    if (detail?.info?.uuid && detail.provider) found.set(detail.info.uuid, detail);
+  };
+  window.addEventListener("eip6963:announceProvider", onAnnouncement);
+  window.dispatchEvent(new Event("eip6963:requestProvider"));
+  await new Promise<void>((resolve) => window.setTimeout(resolve, timeoutMs));
+  window.removeEventListener("eip6963:announceProvider", onAnnouncement);
+  return [...found.values()];
+}
 declare global { interface Window { ethereum?: EIP1193Provider } }
 
 export const BACKFILL_ADDRESS_KEY = "backfill:address";

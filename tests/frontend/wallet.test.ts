@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ensureStudionet, normalizeWalletError, STUDIONET_CHAIN_ID, STUDIONET_EXPLORER_URL, STUDIONET_RPC_URL } from "../../lib/genlayer/wallet";
+import { discoverEIP6963Providers, ensureStudionet, normalizeWalletError, STUDIONET_CHAIN_ID, STUDIONET_EXPLORER_URL, STUDIONET_RPC_URL } from "../../lib/genlayer/wallet";
 
 const studionetMetadata = {
   chainId: STUDIONET_CHAIN_ID,
@@ -25,6 +25,23 @@ function provider(initialChain = STUDIONET_CHAIN_ID) {
 }
 
 describe("injected Studionet wallet flow", () => {
+
+  it("discovers announced EIP-6963 providers without trusting arbitrary event payloads", async () => {
+    const p = provider();
+    const fakeWindow = new EventTarget() as unknown as Window & typeof globalThis;
+    Object.defineProperty(fakeWindow, "setTimeout", { value: setTimeout });
+    vi.stubGlobal("window", fakeWindow);
+    const discovered = discoverEIP6963Providers(0);
+    window.dispatchEvent(new CustomEvent("eip6963:announceProvider", { detail: {
+      info: { uuid: "backfill-test", name: "Test Wallet", icon: "data:image/svg+xml,", rdns: "com.example.test" },
+      provider: p.value,
+    }}));
+    const providers = await discovered;
+    expect(providers).toHaveLength(1);
+    expect(providers[0].info.uuid).toBe("backfill-test");
+    expect(providers[0].provider).toBe(p.value);
+    vi.unstubAllGlobals();
+  });
   it("does not switch or add when already on 61999 and rereads the chain", async () => {
     const p = provider();
     await ensureStudionet(p.value);
