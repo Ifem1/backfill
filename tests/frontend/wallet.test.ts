@@ -42,6 +42,25 @@ describe("injected Studionet wallet flow", () => {
     expect(providers[0].provider).toBe(p.value);
     vi.unstubAllGlobals();
   });
+  it("ignores announcements with incomplete EIP-6963 metadata", async () => {
+    const p = provider();
+    const fakeWindow = new EventTarget() as unknown as Window & typeof globalThis;
+    Object.defineProperty(fakeWindow, "setTimeout", { value: setTimeout });
+    vi.stubGlobal("window", fakeWindow);
+    const discovered = discoverEIP6963Providers(0);
+    window.dispatchEvent(new CustomEvent("eip6963:announceProvider", { detail: {
+      info: { uuid: "missing-name", name: "", icon: "data:image/svg+xml,", rdns: "com.example.bad" },
+      provider: p.value,
+    }}));
+    window.dispatchEvent(new CustomEvent("eip6963:announceProvider", { detail: {
+      info: { uuid: "valid-provider", name: "Valid Wallet", icon: "data:image/svg+xml,", rdns: "com.example.valid" },
+      provider: p.value,
+    }}));
+    const providers = await discovered;
+    expect(providers.map((item) => item.info.uuid)).toEqual(["valid-provider"]);
+    vi.unstubAllGlobals();
+  });
+
   it("does not switch or add when already on 61999 and rereads the chain", async () => {
     const p = provider();
     await ensureStudionet(p.value);

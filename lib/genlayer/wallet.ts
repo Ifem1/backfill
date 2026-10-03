@@ -14,7 +14,8 @@ export async function discoverEIP6963Providers(timeoutMs = 250): Promise<EIP6963
   const found = new Map<string, EIP6963ProviderDetail>();
   const onAnnouncement = (event: Event) => {
     const detail = (event as CustomEvent<EIP6963ProviderDetail>).detail;
-    if (detail?.info?.uuid && detail.provider) found.set(detail.info.uuid, detail);
+    const info = detail?.info;
+    if (info?.uuid && info.name && info.icon && info.rdns && detail.provider) found.set(info.uuid, detail);
   };
   window.addEventListener("eip6963:announceProvider", onAnnouncement);
   window.dispatchEvent(new Event("eip6963:requestProvider"));
