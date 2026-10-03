@@ -23,6 +23,11 @@ export async function discoverEIP6963Providers(timeoutMs = 250): Promise<EIP6963
   window.removeEventListener("eip6963:announceProvider", onAnnouncement);
   return [...found.values()];
 }
+
+/** Choose a stable announced provider before using the legacy window.ethereum fallback. */
+export function selectInjectedProvider(announced: EIP6963ProviderDetail[], fallback?: EIP1193Provider): EIP1193Provider | undefined {
+  return [...announced].sort((left, right) => left.info.uuid.localeCompare(right.info.uuid))[0]?.provider ?? fallback;
+}
 declare global { interface Window { ethereum?: EIP1193Provider } }
 
 export const BACKFILL_ADDRESS_KEY = "backfill:address";
