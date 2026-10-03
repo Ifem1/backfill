@@ -1,7 +1,7 @@
 "use client";
 
 import {createContext,useContext,useEffect,useMemo,useState} from "react";
-import {BACKFILL_ADDRESS_KEY,ensureStudionet,getWindowProvider,normalizeWalletError,STUDIONET_CHAIN_ID,type EIP1193Provider} from "@/lib/genlayer/wallet";
+import {BACKFILL_ADDRESS_KEY,discoverEIP6963Providers,ensureStudionet,getWindowProvider,normalizeWalletError,selectInjectedProvider,STUDIONET_CHAIN_ID,type EIP1193Provider} from "@/lib/genlayer/wallet";
 
 type WalletStatus="DISCONNECTED"|"CONNECTING"|"CONNECTED"|"WRONG_NETWORK";
 type Session={address:string;provider:EIP1193Provider};
@@ -19,24 +19,34 @@ export function WalletProvider({children}:{children:React.ReactNode}) {
   const applyAccount=(next:string)=>{setAddress(next);if(next) window.localStorage.setItem(BACKFILL_ADDRESS_KEY,next);else window.localStorage.removeItem(BACKFILL_ADDRESS_KEY);setStatus(next?(chainId.toLowerCase()===STUDIONET_CHAIN_ID?"CONNECTED":"WRONG_NETWORK"):"DISCONNECTED")};
 
   useEffect(()=>{
-    if(typeof window === "undefined" || !window.ethereum) return;
-    const current=window.ethereum;setProvider(current);
+    if(typeof window === "undefined") return;
+    let active=true;
+    let selected:EIP1193Provider|undefined;
     const saved=window.localStorage.getItem(BACKFILL_ADDRESS_KEY);
     if(saved) {setAddress(saved);setStatus("WRONG_NETWORK");}
-    void Promise.all([
-      current.request({method:"eth_accounts"}) as Promise<string[]>,
-      current.request({method:"eth_chainId"}) as Promise<string>,
-    ]).then(([accounts,chain])=>{
-      const authorized=(accounts||[]).find(a=>!saved||a.toLowerCase()===saved.toLowerCase())||"";
-      if(saved && !authorized) {window.localStorage.removeItem(BACKFILL_ADDRESS_KEY);setAddress("");setStatus("DISCONNECTED");}
-      else if(authorized) {setAddress(authorized);setStatus(String(chain).toLowerCase()===STUDIONET_CHAIN_ID?"CONNECTED":"WRONG_NETWORK");}
-      setChainId(String(chain));
-    }).catch(()=>setError("Studionet RPC is currently unavailable."));
     const accountsChanged=(value:unknown)=>applyAccount((value as string[]|undefined)?.[0]||"");
     const chainChanged=(value:unknown)=>applyChain(String(value));
     const disconnected=()=>{setAddress("");setChainId("");setStatus("DISCONNECTED");window.localStorage.removeItem(BACKFILL_ADDRESS_KEY);};
-    current.on?.("accountsChanged",accountsChanged);current.on?.("chainChanged",chainChanged);current.on?.("disconnect",disconnected);
-    return()=>{current.removeListener?.("accountsChanged",accountsChanged);current.removeListener?.("chainChanged",chainChanged);current.removeListener?.("disconnect",disconnected)};
+    void (async()=>{
+      const announced=await discoverEIP6963Providers();
+      const current=selectInjectedProvider(announced,window.ethereum);
+      if(!active || !current) return;
+      selected=current;
+      setProvider(current);
+      current.on?.("accountsChanged",accountsChanged);current.on?.("chainChanged",chainChanged);current.on?.("disconnect",disconnected);
+      try {
+        const [accounts,chain]=await Promise.all([
+          current.request({method:"eth_accounts"}) as Promise<string[]>,
+          current.request({method:"eth_chainId"}) as Promise<string>,
+        ]);
+        if(!active) return;
+        const authorized=(accounts||[]).find(a=>!saved||a.toLowerCase()===saved.toLowerCase())||"";
+        if(saved && !authorized) {window.localStorage.removeItem(BACKFILL_ADDRESS_KEY);setAddress("");setStatus("DISCONNECTED");}
+        else if(authorized) {setAddress(authorized);setStatus(String(chain).toLowerCase()===STUDIONET_CHAIN_ID?"CONNECTED":"WRONG_NETWORK");}
+        setChainId(String(chain));
+      } catch { if(active) setError("Studionet RPC is currently unavailable."); }
+    })();
+    return()=>{active=false;selected?.removeListener?.("accountsChanged",accountsChanged);selected?.removeListener?.("chainChanged",chainChanged);selected?.removeListener?.("disconnect",disconnected);};
   },[]);
 
   const connect=async()=>{

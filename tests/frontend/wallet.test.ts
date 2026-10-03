@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { discoverEIP6963Providers, ensureStudionet, normalizeWalletError, STUDIONET_CHAIN_ID, STUDIONET_EXPLORER_URL, STUDIONET_RPC_URL } from "../../lib/genlayer/wallet";
+import { discoverEIP6963Providers, ensureStudionet, normalizeWalletError, selectInjectedProvider, STUDIONET_CHAIN_ID, STUDIONET_EXPLORER_URL, STUDIONET_RPC_URL } from "../../lib/genlayer/wallet";
 
 const studionetMetadata = {
   chainId: STUDIONET_CHAIN_ID,
@@ -59,6 +59,17 @@ describe("injected Studionet wallet flow", () => {
     const providers = await discovered;
     expect(providers.map((item) => item.info.uuid)).toEqual(["valid-provider"]);
     vi.unstubAllGlobals();
+  });
+
+  it("selects a stable valid EIP-6963 announcement before the legacy fallback", () => {
+    const fallback=provider().value;
+    const later=provider().value;
+    const earlier=provider().value;
+    expect(selectInjectedProvider([
+      {info:{uuid:"z-provider",name:"Later",icon:"data:image/svg+xml,",rdns:"example.z"},provider:later},
+      {info:{uuid:"a-provider",name:"Earlier",icon:"data:image/svg+xml,",rdns:"example.a"},provider:earlier},
+    ],fallback)).toBe(earlier);
+    expect(selectInjectedProvider([],fallback)).toBe(fallback);
   });
 
   it("does not switch or add when already on 61999 and rereads the chain", async () => {
