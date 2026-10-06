@@ -5,7 +5,7 @@ import {useEffect, useState} from "react";
 import {config} from "@/lib/config";
 import {explorerTx, getStoredTransaction, readContractWithRetry, verifyTriggeredPayoutDelivery, type PayoutDelivery} from "@/lib/genlayer/client";
 import {formatGen} from "@/lib/genlayer/amounts";
-import {payoutDeliveryPresentation} from "@/lib/ui/payout-delivery";
+import {isPayoutSettlementActive, payoutDeliveryPresentation} from "@/lib/ui/payout-delivery";
 import {ContractAction} from "@/components/contract-action";
 import {useWallet} from "@/components/wallet-provider";
 
@@ -36,6 +36,7 @@ export function ClaimState({id}: {id: number}) {
   const [delivery, setDelivery] = useState<PayoutDelivery>();
   const [deliveryCheck, setDeliveryCheck] = useState(0);
   const {address} = useWallet();
+  const payoutInitiated = isPayoutSettlementActive(settlement?.status);
 
   const load = async () => {
     setError("");
@@ -65,7 +66,7 @@ export function ClaimState({id}: {id: number}) {
 
   useEffect(() => {
     let current = true;
-    if (!settlement || !parentHash) { setDelivery(undefined); return; }
+    if (!payoutInitiated || !parentHash) { setDelivery(undefined); return; }
     let recipient: string;
     let amount: bigint;
     try {
@@ -79,7 +80,7 @@ export function ClaimState({id}: {id: number}) {
       .then(result => { if (current) setDelivery(result); })
       .catch(() => { if (current) setDelivery({state: "PENDING_OR_UNVERIFIED", reason: "PARENT_EXECUTION_UNVERIFIED", parentHash}); });
     return () => { current = false; };
-  }, [deliveryCheck, parentHash, settlement?.amount, settlement?.identity, settlement?.recipient]);
+  }, [deliveryCheck, parentHash, payoutInitiated, settlement?.amount, settlement?.identity, settlement?.recipient]);
 
   if (error) return <p className="border-l-4 border-[var(--coral)] p-4">{error}</p>;
   if (!claim) return <p className="mono">Reading canonical claim state…</p>;
@@ -88,7 +89,7 @@ export function ClaimState({id}: {id: number}) {
   const canChallenge = Boolean(address) && epoch?.status === "CHALLENGE" && !claim.challenge_used && claim.status !== "CHALLENGED" && address.toLowerCase() !== claim.claimant.toLowerCase() && now < Number(epoch.challenge_close);
   const canEvaluate = epoch?.status === "EVALUATING" && (claim.status === "SUBMITTED" || (claim.status === "INCONCLUSIVE" && claim.retryable === true));
   const canExpire = epoch?.status === "EVALUATING" && now >= Number(epoch.claims_close) && (claim.status === "SUBMITTED" || (claim.status === "INCONCLUSIVE" && claim.retryable === true));
-  const deliveryView = payoutDeliveryPresentation(Boolean(settlement), parentHash || undefined, delivery);
+  const deliveryView = payoutDeliveryPresentation(payoutInitiated, parentHash || undefined, delivery);
   const deliveryTone = deliveryView.tone === "confirmed" ? "border-[var(--blue)]" : deliveryView.tone === "failed" ? "border-[var(--coral)]" : "border-[var(--line)]";
 
   async function completeClaim(result?: {hash: string}) {
@@ -133,7 +134,7 @@ export function ClaimState({id}: {id: number}) {
           <p className="mt-3 text-xs">{deliveryView.parentState}</p>
           {parentHash ? <p className="mt-3 break-all text-xs">Parent claim transaction: <a className="underline" target="_blank" rel="noreferrer" href={explorerTx(parentHash)}>{parentHash}</a></p> : <p className="mt-3 text-xs">Parent claim transaction: unavailable in this browser.</p>}
           {deliveryView.childHash && <p className="mt-3 break-all text-xs">{deliveryView.tone === "confirmed" ? "Confirmed external transfer" : "Observed external transfer"}: <a className="underline" target="_blank" rel="noreferrer" href={explorerTx(deliveryView.childHash)}>{deliveryView.childHash}</a></p>}
-          {settlement && parentHash && <button className="button mt-4" onClick={() => setDeliveryCheck(value => value + 1)}>Recheck delivery</button>}
+          {payoutInitiated && parentHash && <button className="button mt-4" onClick={() => setDeliveryCheck(value => value + 1)}>Recheck delivery</button>}
         </div>
       </aside>
     </div>
