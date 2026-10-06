@@ -1,20 +1,123 @@
-import {describe, expect, it, vi} from "vitest"; import {getPendingTransactions, selectTriggeredTransfer, verifyTriggeredPayoutDelivery, writeAndConfirm, type PayoutDeliveryServices} from "../../lib/genlayer/client"; import {nestedLeaderExecutionReceipt, nestedLeaderFailureReceipt, topLevelExecutionReceipt} from "./fixtures/studionet-receipts";  function fakeClient(receipt:any={txExecutionResultName:"FINISHED_WITH_RETURN"}) {   const client:any={     connect:vi.fn(async()=>undefined),     writeContract:vi.fn(async()=>"0xabc"),   };   return {client, receipt}; }  describe("write transaction safety", () => {   it("persists the hash immediately and retains it when finalization fails", async () => {     const storage = new Map<string, string>();     vi.stubGlobal("window", {localStorage: {getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value)}});     const {client}=fakeClient();     const submitted:string[]=[];     await expect(writeAndConfirm(client,"0x0000000000000000000000000000000000000001","fund",[7],0n,undefined,undefined,{actionKey:"resume-me",waitForFinalization:async()=>{expect(getPendingTransactions()[0].hash).toBe("0xabc"); throw new Error("rpc unavailable")},onSubmitted:hash=>submitted.push(hash)})).rejects.toThrow(/rpc unavailable/);     expect(submitted).toEqual(["0xabc"]);     expect(getPendingTransactions().find(item=>item.actionKey==="resume-me")?.hash).toBe("0xabc");     vi.unstubAllGlobals();   });   it("sends payable value in wei and rereads canonical state", async () => {     const {client,receipt}=fakeClient();     const stages:string[]=[]; let canonical=0; let request:any;     client.writeContract=vi.fn(async(input:any)=>{request=input; return "0xabc";});     const result=await writeAndConfirm(client,"0x0000000000000000000000000000000000000001","fund",[7],1000000000000000000n,s=>stages.push(s),async()=>{canonical++;},{waitForFinalization:async()=>receipt});     expect(request.value).toBe(1000000000000000000n);     expect(client.connect).not.toHaveBeenCalled();     expect(request.fees).toBeUndefined();     expect(result.hash).toBe("0xabc");     expect(canonical).toBe(1);     expect(stages).toContain("EXECUTION_CONFIRMED");   });    it("surfaces rejected wallet transactions", async () => {     const {client}=fakeClient(); client.writeContract=vi.fn(async()=>{throw new Error("User rejected the request")});     const stages:string[]=[];     await expect(writeAndConfirm(client,"0x1","x",[],0n,s=>stages.push(s))).rejects.toThrow(/rejected/);     expect(stages).toContain("USER_REJECTED");   });    it("does not report success for reverted execution", async () => {     const {client}=fakeClient({txExecutionResultName:"REVERTED"}); const stages:string[]=[];     await expect(writeAndConfirm(client,"0x1","x",[],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>({txExecutionResultName:"REVERTED"})})).rejects.toThrow(/execution failed/);     expect(stages).toContain("EXECUTION_ERROR");   });    it("surfaces consensus failure after submission", async () => {     const {client}=fakeClient(); const stages:string[]=[];     await expect(writeAndConfirm(client,"0x1","x",[],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>{throw new Error("consensus failed")}})).rejects.toThrow(/consensus/);     expect(stages).toContain("CONSENSUS_FAILURE");   });    it("classifies an undetermined post-submission transaction and allows a fresh attempt", async () => {     const storage = new Map<string, string>();     vi.stubGlobal("window", {localStorage: {getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value)}});     const {client}=fakeClient(); const stages:string[]=[];     await expect(writeAndConfirm(client,"0x1","evaluate_claim",[3],0n,s=>stages.push(s),undefined,{actionKey:"evaluate:3",account:"0xabc",chainId:"0xf22f",waitForFinalization:async()=>({statusName:"UNDETERMINED"})})).rejects.toThrow(/not executed/);     expect(stages).toContain("CONSENSUS_UNDETERMINED");     expect(getPendingTransactions("0xabc","0xf22f")).toHaveLength(0);     expect(JSON.parse(storage.get("backfill.transactions") || "[]")[0]).toMatchObject({hash:"0xabc",stage:"CONSENSUS_UNDETERMINED",account:"0xabc",chainId:"0xf22f"});     vi.unstubAllGlobals();   });    it("accepts the nested Studionet leader execution result", async () => {     const storage = new Map<string, string>();     vi.stubGlobal("window", {localStorage: {getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value)}});     const {client}=fakeClient();     const stages:string[]=[];     const result=await writeAndConfirm(client,"0x1","open_epoch",[1],0n,s=>stages.push(s),undefined,{actionKey:"open:1",account:"0xabc",chainId:"0xf22f",waitForFinalization:async()=>nestedLeaderExecutionReceipt});     expect(result.hash).toBe("0xabc");     expect(stages).toContain("EXECUTION_CONFIRMED");     expect(getPendingTransactions("0xabc","0xf22f")).toHaveLength(0);     vi.unstubAllGlobals();   });    it("accepts the top-level Studionet txExecutionResult shape", async () => {     const {client}=fakeClient(); const stages:string[]=[];     const result=await writeAndConfirm(client,"0x1","finalize_pool",[4],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>topLevelExecutionReceipt});     expect(result.receipt).toBe(topLevelExecutionReceipt);     expect(stages).toContain("EXECUTION_CONFIRMED");   });    it("rejects a failed nested Studionet leader receipt", async () => {     const {client}=fakeClient(); const stages:string[]=[];     await expect(writeAndConfirm(client,"0x1","refund_unallocated",[4],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>nestedLeaderFailureReceipt})).rejects.toThrow(/execution failed: REVERTED/);     expect(stages).toContain("EXECUTION_ERROR");   });    it("identifies a triggered child by parent-derived id, recipient, and exact value", () => {     const child = selectTriggeredTransfer("0xparent", ["0xwrong", "0xchild"], [{to:"0x0000000000000000000000000000000000000002", value:2n}, {recipient:"0x0000000000000000000000000000000000000001", value:"1000000000000000000"}], "0x0000000000000000000000000000000000000001", 1000000000000000000n);     expect(child?.hash).toBe("0xchild");   }); });
-const parentA="0x"+"a".repeat(64),parentB="0x"+"b".repeat(64),recipient="0x0000000000000000000000000000000000000001",amount=1000000000000000000n;
-const deliveredChild=(x:any={})=>({recipient,value:String(amount),statusName:"FINALIZED",txExecutionResultName:"SUCCESS",value_credited:true,...x});
-const finalizedParent=(x:any={})=>({statusName:"FINALIZED",txExecutionResultName:"SUCCESS",...x});
-const deliveryServices=(children:any,parents:any={}):PayoutDeliveryServices=>{const p={...Object.fromEntries(Object.keys(children).map(h=>[h,finalizedParent()])),...parents};return{getTriggeredTransactionIds:async h=>Object.keys(children[h]||{}),getTransaction:async h=>p[h]??Object.values(children).flatMap((x:any)=>Object.entries(x)).find(([id])=>id===h)?.[1]}};
-const verify=(child:any,parentHash=parentA,parents:any={})=>verifyTriggeredPayoutDelivery(parentHash,recipient,amount,deliveryServices({[parentHash]:{"0xchild":child}},parents));
+import {describe, expect, it, vi} from "vitest";
+import {getPendingTransactions, selectTriggeredTransfer, verifyTriggeredPayoutDelivery, writeAndConfirm, type PayoutDeliveryServices} from "../../lib/genlayer/client";
+import {nestedLeaderExecutionReceipt, nestedLeaderFailureReceipt, topLevelExecutionReceipt} from "./fixtures/studionet-receipts";
+
+function fakeClient(receipt:any={txExecutionResultName:"FINISHED_WITH_RETURN"}) {
+  const client:any={
+    connect:vi.fn(async()=>undefined),
+    writeContract:vi.fn(async()=>"0xabc"),
+  };
+  return {client, receipt};
+}
+
+describe("write transaction safety", () => {
+  it("persists the hash immediately and retains it when finalization fails", async () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {localStorage: {getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value)}});
+    const {client}=fakeClient();
+    const submitted:string[]=[];
+    await expect(writeAndConfirm(client,"0x0000000000000000000000000000000000000001","fund",[7],0n,undefined,undefined,{actionKey:"resume-me",waitForFinalization:async()=>{expect(getPendingTransactions()[0].hash).toBe("0xabc"); throw new Error("rpc unavailable")},onSubmitted:hash=>submitted.push(hash)})).rejects.toThrow(/rpc unavailable/);
+    expect(submitted).toEqual(["0xabc"]);
+    expect(getPendingTransactions().find(item=>item.actionKey==="resume-me")?.hash).toBe("0xabc");
+    vi.unstubAllGlobals();
+  });
+  it("sends payable value in wei and rereads canonical state", async () => {
+    const {client,receipt}=fakeClient();
+    const stages:string[]=[]; let canonical=0; let request:any;
+    client.writeContract=vi.fn(async(input:any)=>{request=input; return "0xabc";});
+    const result=await writeAndConfirm(client,"0x0000000000000000000000000000000000000001","fund",[7],1000000000000000000n,s=>stages.push(s),async()=>{canonical++;},{waitForFinalization:async()=>receipt});
+    expect(request.value).toBe(1000000000000000000n);
+    expect(client.connect).not.toHaveBeenCalled();
+    expect(request.fees).toBeUndefined();
+    expect(result.hash).toBe("0xabc");
+    expect(canonical).toBe(1);
+    expect(stages).toContain("EXECUTION_CONFIRMED");
+  });
+
+  it("surfaces rejected wallet transactions", async () => {
+    const {client}=fakeClient(); client.writeContract=vi.fn(async()=>{throw new Error("User rejected the request")});
+    const stages:string[]=[];
+    await expect(writeAndConfirm(client,"0x1","x",[],0n,s=>stages.push(s))).rejects.toThrow(/rejected/);
+    expect(stages).toContain("USER_REJECTED");
+  });
+
+  it("does not report success for reverted execution", async () => {
+    const {client}=fakeClient({txExecutionResultName:"REVERTED"}); const stages:string[]=[];
+    await expect(writeAndConfirm(client,"0x1","x",[],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>({txExecutionResultName:"REVERTED"})})).rejects.toThrow(/execution failed/);
+    expect(stages).toContain("EXECUTION_ERROR");
+  });
+
+  it("surfaces consensus failure after submission", async () => {
+    const {client}=fakeClient(); const stages:string[]=[];
+    await expect(writeAndConfirm(client,"0x1","x",[],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>{throw new Error("consensus failed")}})).rejects.toThrow(/consensus/);
+    expect(stages).toContain("CONSENSUS_FAILURE");
+  });
+
+  it("classifies an undetermined post-submission transaction and allows a fresh attempt", async () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {localStorage: {getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value)}});
+    const {client}=fakeClient(); const stages:string[]=[];
+    await expect(writeAndConfirm(client,"0x1","evaluate_claim",[3],0n,s=>stages.push(s),undefined,{actionKey:"evaluate:3",account:"0xabc",chainId:"0xf22f",waitForFinalization:async()=>({statusName:"UNDETERMINED"})})).rejects.toThrow(/not executed/);
+    expect(stages).toContain("CONSENSUS_UNDETERMINED");
+    expect(getPendingTransactions("0xabc","0xf22f")).toHaveLength(0);
+    expect(JSON.parse(storage.get("backfill.transactions") || "[]")[0]).toMatchObject({hash:"0xabc",stage:"CONSENSUS_UNDETERMINED",account:"0xabc",chainId:"0xf22f"});
+    vi.unstubAllGlobals();
+  });
+
+  it("accepts the nested Studionet leader execution result", async () => {
+    const storage = new Map<string, string>();
+    vi.stubGlobal("window", {localStorage: {getItem: (key: string) => storage.get(key) || null, setItem: (key: string, value: string) => storage.set(key, value)}});
+    const {client}=fakeClient();
+    const stages:string[]=[];
+    const result=await writeAndConfirm(client,"0x1","open_epoch",[1],0n,s=>stages.push(s),undefined,{actionKey:"open:1",account:"0xabc",chainId:"0xf22f",waitForFinalization:async()=>nestedLeaderExecutionReceipt});
+    expect(result.hash).toBe("0xabc");
+    expect(stages).toContain("EXECUTION_CONFIRMED");
+    expect(getPendingTransactions("0xabc","0xf22f")).toHaveLength(0);
+    vi.unstubAllGlobals();
+  });
+
+  it("accepts the top-level Studionet txExecutionResult shape", async () => {
+    const {client}=fakeClient(); const stages:string[]=[];
+    const result=await writeAndConfirm(client,"0x1","finalize_pool",[4],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>topLevelExecutionReceipt});
+    expect(result.receipt).toBe(topLevelExecutionReceipt);
+    expect(stages).toContain("EXECUTION_CONFIRMED");
+  });
+
+  it("rejects a failed nested Studionet leader receipt", async () => {
+    const {client}=fakeClient(); const stages:string[]=[];
+    await expect(writeAndConfirm(client,"0x1","refund_unallocated",[4],0n,s=>stages.push(s),undefined,{waitForFinalization:async()=>nestedLeaderFailureReceipt})).rejects.toThrow(/execution failed: REVERTED/);
+    expect(stages).toContain("EXECUTION_ERROR");
+  });
+
+  it("identifies a triggered child by parent-derived id, recipient, and exact value", () => {
+    const child = selectTriggeredTransfer("0xparent", ["0xwrong", "0xchild"], [{to:"0x0000000000000000000000000000000000000002", value:2n}, {recipient:"0x0000000000000000000000000000000000000001", value:"1000000000000000000"}], "0x0000000000000000000000000000000000000001", 1000000000000000000n);
+    expect(child?.hash).toBe("0xchild");
+  });
+});
+
+const P="0x"+"a".repeat(64), Q="0x"+"b".repeat(64), R="0x0000000000000000000000000000000000000001", A=1000000000000000000n;
+const child=(x:any={})=>({recipient:R,value:String(A),statusName:"FINALIZED",txExecutionResultName:"SUCCESS",value_credited:true,...x});
+const parent=(x:any={})=>({statusName:"FINALIZED",txExecutionResultName:"SUCCESS",...x});
+const services=(children:any, parents:any={}):PayoutDeliveryServices=>({
+  getTriggeredTransactionIds:async h=>Object.keys(children[h]||{}),
+  getTransaction:async h=>parents[h]??(h===P||h===Q?parent():children[P]?.[h]??children[Q]?.[h]),
+});
+const verify=(c:any, p=P, s?:PayoutDeliveryServices)=>verifyTriggeredPayoutDelivery(p,R,A,s||services({[p]:{"0xc":c}}));
+
 describe("triggered payout delivery verification",()=>{
- it("confirms exact credited child",async()=>expect(await verify(deliveredChild())).toMatchObject({state:"CONFIRMED",reason:"DELIVERY_CONFIRMED",childHash:"0xchild"}));
- it.each([["pending",finalizedParent({statusName:"PENDING"}),"PARENT_NOT_FINALIZED"],["accepted",finalizedParent({statusName:"ACCEPTED"}),"PARENT_NOT_FINALIZED"],["malformed",finalizedParent({statusName:7}),"PARENT_NOT_FINALIZED"]])("rejects non-final parent %s",async(_,p,reason)=>{const triggered=vi.fn(async()=>["0xchild"]),r=await verifyTriggeredPayoutDelivery(parentA,recipient,amount,{getTriggeredTransactionIds:triggered,getTransaction:async h=>h===parentA?p:deliveredChild()});expect(r).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason});expect(triggered).not.toHaveBeenCalled()});
- it.each([["missing",(()=>{const{txExecutionResultName,...rest}=finalizedParent();return rest})(),"PARENT_EXECUTION_UNVERIFIED"],["malformed",finalizedParent({txExecutionResultName:7}),"PARENT_EXECUTION_UNVERIFIED"],["failed",finalizedParent({txExecutionResultName:"REVERTED"}),"PARENT_EXECUTION_FAILED"]])("rejects parent execution %s",async(_,p,reason)=>expect(await verifyTriggeredPayoutDelivery(parentA,recipient,amount,deliveryServices({[parentA]:{"0xchild":deliveredChild()}},{[parentA]:p}))).toMatchObject({state:reason==="PARENT_EXECUTION_FAILED"?"FAILED_OR_UNCREDITED":"PENDING_OR_UNVERIFIED",reason}));
- it("rejects malformed parent before child lookup",async()=>{const get=vi.fn(async()=>finalizedParent()),triggered=vi.fn(async()=>["0xchild"]),r=await verifyTriggeredPayoutDelivery("0xabc",recipient,amount,{getTransaction:get,getTriggeredTransactionIds:triggered});expect(r).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"MALFORMED_PARENT"});expect(get).not.toHaveBeenCalled();expect(triggered).not.toHaveBeenCalled()});
- it("rejects no triggered child",async()=>expect(await verifyTriggeredPayoutDelivery(parentA,recipient,amount,deliveryServices({[parentA]:{}}))).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"NO_TRIGGERED_CHILD"}));
- it.each([["recipient",deliveredChild({recipient:"0x0000000000000000000000000000000000000002"}),"NO_MATCHING_CHILD"],["amount",deliveredChild({value:"999"}),"NO_MATCHING_CHILD"],["malformed recipient",deliveredChild({recipient:"bad"}),"NO_MATCHING_CHILD"],["malformed amount",deliveredChild({value:"1e18"}),"NO_MATCHING_CHILD"]])("rejects child %s",async(_,c,reason)=>expect(await verify(c)).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason}));
- it.each([["pending","PENDING"],["accepted","ACCEPTED"],["malformed",7]])("rejects child finality %s",async(_,status)=>expect(await verify(deliveredChild({statusName:status}))).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"CHILD_NOT_FINALIZED"}));
- it("rejects failed child",async()=>expect(await verify(deliveredChild({txExecutionResultName:"REVERTED"}))).toMatchObject({state:"FAILED_OR_UNCREDITED",reason:"CHILD_EXECUTION_FAILED"}));
- it.each([["false",false,"FAILED_OR_UNCREDITED","VALUE_NOT_CREDITED"],["missing",undefined,"PENDING_OR_UNVERIFIED","VALUE_CREDIT_UNVERIFIED"],["malformed","true","PENDING_OR_UNVERIFIED","VALUE_CREDIT_UNVERIFIED"]])("requires value credit %s",async(_,value,state,reason)=>{const c=value===undefined?(()=>{const{value_credited,...rest}=deliveredChild();return rest})():deliveredChild({value_credited:value});expect(await verify(c)).toMatchObject({state,reason})});
- it("selects exactly one matching child and rejects ambiguity",async()=>{const one=await verifyTriggeredPayoutDelivery(parentA,recipient,amount,deliveryServices({[parentA]:{"0xother":deliveredChild({recipient:"0x0000000000000000000000000000000000000002"}),"0xdelivery":deliveredChild()}}));expect(one).toMatchObject({state:"CONFIRMED",childHash:"0xdelivery"});const many=await verifyTriggeredPayoutDelivery(parentA,recipient,amount,deliveryServices({[parentA]:{"0xone":deliveredChild(),"0xtwo":deliveredChild()}}));expect(many).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"AMBIGUOUS_MATCHING_CHILD"})});
- it("binds parent namespace and cannot rescue a failed parent",async()=>{const s=deliveryServices({[parentA]:{"0xa":deliveredChild()},[parentB]:{"0xb":deliveredChild({value:"2"})}});expect(await verifyTriggeredPayoutDelivery(parentA,recipient,amount,s)).toMatchObject({state:"CONFIRMED",childHash:"0xa"});expect(await verifyTriggeredPayoutDelivery(parentB,recipient,amount,s)).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"NO_MATCHING_CHILD"});const triggered=vi.fn(async()=>["0xchild"]),r=await verifyTriggeredPayoutDelivery(parentA,recipient,amount,{getTriggeredTransactionIds:triggered,getTransaction:async h=>h===parentA?finalizedParent({txExecutionResultName:"REVERTED"}):deliveredChild()});expect(r).toMatchObject({state:"FAILED_OR_UNCREDITED",reason:"PARENT_EXECUTION_FAILED"});expect(triggered).not.toHaveBeenCalled()});
- it("rejects parent success without credit and malformed addresses",async()=>{expect(await verify(deliveredChild({value_credited:false}))).toMatchObject({state:"FAILED_OR_UNCREDITED",reason:"VALUE_NOT_CREDITED"});expect(await verifyTriggeredPayoutDelivery(parentA,"bad",amount,deliveryServices({[parentA]:{"0xchild":deliveredChild()}}))).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"MALFORMED_CHILD"});expect(await verifyTriggeredPayoutDelivery(parentA,recipient,amount,deliveryServices({[parentA]:{"0xchild":deliveredChild({to:"0x0000000000000000000000000000000000000002"})}}))).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"NO_MATCHING_CHILD"})});
+  it("confirms one exact credited child",async()=>expect(await verify(child())).toMatchObject({state:"CONFIRMED",reason:"DELIVERY_CONFIRMED",childHash:"0xc"}));
+  it.each([["pending","PENDING"],["accepted","ACCEPTED"],["malformed",7]])("rejects non-final parent %s",async(_,status)=>{
+    const called=vi.fn(async()=>["0xc"]), r=await verifyTriggeredPayoutDelivery(P,R,A,{getTriggeredTransactionIds:called,getTransaction:async h=>h===P?parent({statusName:status}):child()});
+    expect(r).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"PARENT_NOT_FINALIZED"}); expect(called).not.toHaveBeenCalled();
+  });
+  it.each([["missing",(()=>{const{txExecutionResultName,...x}=parent();return x})(),"PARENT_EXECUTION_UNVERIFIED"],["malformed",parent({txExecutionResultName:7}),"PARENT_EXECUTION_UNVERIFIED"],["failed",parent({txExecutionResultName:"REVERTED"}),"PARENT_EXECUTION_FAILED"]])("rejects parent execution %s",async(_,p,reason)=>expect(await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{"0xc":child()}},{[P]:p}))).toMatchObject({reason,state:reason==="PARENT_EXECUTION_FAILED"?"FAILED_OR_UNCREDITED":"PENDING_OR_UNVERIFIED"}));
+  it("rejects malformed parent without lookup",async()=>{const get=vi.fn(), t=vi.fn(); const r=await verifyTriggeredPayoutDelivery("0xabc",R,A,{getTransaction:get,getTriggeredTransactionIds:t}); expect(r).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"MALFORMED_PARENT"}); expect(get).not.toHaveBeenCalled(); expect(t).not.toHaveBeenCalled()});
+  it("rejects no child",async()=>expect(await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{}}))).toMatchObject({reason:"NO_TRIGGERED_CHILD",state:"PENDING_OR_UNVERIFIED"}));
+  it.each([["recipient",{recipient:"0x0000000000000000000000000000000000000002"}],["amount",{value:"2"}],["bad recipient",{recipient:"bad"}],["bad amount",{value:"1e18"}]])("rejects child %s",async(_,x)=>expect(await verify(child(x))).toMatchObject({reason:"NO_MATCHING_CHILD",state:"PENDING_OR_UNVERIFIED"}));
+  it.each([["pending","PENDING"],["accepted","ACCEPTED"],["malformed",7]])("rejects child finality %s",async(_,status)=>expect(await verify(child({statusName:status}))).toMatchObject({reason:"CHILD_NOT_FINALIZED",state:"PENDING_OR_UNVERIFIED"}));
+  it("rejects failed child",async()=>expect(await verify(child({txExecutionResultName:"REVERTED"}))).toMatchObject({reason:"CHILD_EXECUTION_FAILED",state:"FAILED_OR_UNCREDITED"}));
+  it.each([["false",false,"VALUE_NOT_CREDITED","FAILED_OR_UNCREDITED"],["missing",undefined,"VALUE_CREDIT_UNVERIFIED","PENDING_OR_UNVERIFIED"],["malformed","true","VALUE_CREDIT_UNVERIFIED","PENDING_OR_UNVERIFIED"]])("requires value credit %s",async(_,v,reason,state)=>{const c=v===undefined?(()=>{const{value_credited,...x}=child();return x})():child({value_credited:v}); expect(await verify(c)).toMatchObject({reason,state})});
+  it("selects one match and rejects ambiguity",async()=>{const one=await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{"0xa":child({recipient:"0x0000000000000000000000000000000000000002"}),"0xb":child()}})); expect(one).toMatchObject({state:"CONFIRMED",childHash:"0xb"}); const many=await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{"0xa":child(),"0xb":child()}})); expect(many).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"AMBIGUOUS_MATCHING_CHILD"})});
+  it("binds parent namespace and rejects rescue",async()=>{const s=services({[P]:{"0xa":child()},[Q]:{"0xb":child({value:"2"})}}); expect(await verifyTriggeredPayoutDelivery(P,R,A,s)).toMatchObject({state:"CONFIRMED",childHash:"0xa"}); expect(await verifyTriggeredPayoutDelivery(Q,R,A,s)).toMatchObject({reason:"NO_MATCHING_CHILD"}); const t=vi.fn(async()=>["0xc"]),r=await verifyTriggeredPayoutDelivery(P,R,A,{getTriggeredTransactionIds:t,getTransaction:async h=>h===P?parent({txExecutionResultName:"REVERTED"}):child()}); expect(r).toMatchObject({reason:"PARENT_EXECUTION_FAILED"}); expect(t).not.toHaveBeenCalled()});
+  it("fails closed for malformed target and parent success alone",async()=>{expect(await verifyTriggeredPayoutDelivery(P,"bad",A,services({[P]:{"0xc":child()}}))).toMatchObject({reason:"MALFORMED_CHILD"}); expect(await verify(child({value_credited:false}))).toMatchObject({reason:"VALUE_NOT_CREDITED"})});
 });
