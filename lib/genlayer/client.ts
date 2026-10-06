@@ -53,6 +53,124 @@ export async function findTriggeredTransfer(parentHash: string, recipient: strin
   return selectTriggeredTransfer(parentHash, ids as string[], transactions, recipient, amount);
 }
 
+export type PayoutDeliveryState = "CONFIRMED" | "PENDING_OR_UNVERIFIED" | "FAILED_OR_UNCREDITED";
+export type PayoutDeliveryReason = "DELIVERY_CONFIRMED" | "MALFORMED_PARENT" | "PARENT_NOT_FINALIZED" | "PARENT_EXECUTION_UNVERIFIED" | "PARENT_EXECUTION_FAILED" | "NO_TRIGGERED_CHILD" | "NO_MATCHING_CHILD" | "AMBIGUOUS_MATCHING_CHILD" | "CHILD_NOT_FINALIZED" | "CHILD_EXECUTION_FAILED" | "VALUE_NOT_CREDITED" | "VALUE_CREDIT_UNVERIFIED" | "MALFORMED_CHILD";
+export type PayoutDelivery = {state: PayoutDeliveryState; reason: PayoutDeliveryReason; parentHash: string; childHash?: string; transaction?: unknown};
+export type PayoutDeliveryServices = {
+  getTriggeredTransactionIds: (parentHash: string) => Promise<string[]>;
+  getTransaction: (hash: string) => Promise<unknown>;
+};
+
+function canonicalAddress(value: unknown): string | undefined {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{40}$/.test(value) ? value.toLowerCase() : undefined;
+}
+
+function canonicalTransactionHash(value: unknown): string | undefined {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value) ? value.toLowerCase() : undefined;
+}
+
+function exactWei(value: unknown): bigint | undefined {
+  if (typeof value === "bigint") return value >= 0n ? value : undefined;
+  if (typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value)) return BigInt(value);
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  return undefined;
+}
+
+function unanimous<T>(values: T[]): T | undefined {
+  return values.length > 0 && values.every(value => value === values[0]) ? values[0] : undefined;
+}
+
+function childRecipient(transaction: any): string | undefined {
+  const supplied = [transaction?.recipient, transaction?.to, transaction?.message?.recipient].filter(value => value !== undefined);
+  const normalized = supplied.map(canonicalAddress);
+  return normalized.every(Boolean) ? unanimous(normalized as string[]) : undefined;
+}
+
+function childValue(transaction: any): bigint | undefined {
+  const supplied = [transaction?.value, transaction?.message?.value].filter(value => value !== undefined);
+  const normalized = supplied.map(exactWei);
+  return normalized.every(value => value !== undefined) ? unanimous(normalized as bigint[]) : undefined;
+}
+
+function childStatus(transaction: any): string | undefined {
+  if (typeof transaction?.statusName === "string") return transaction.statusName;
+  return typeof transaction?.status === "string" ? transaction.status : undefined;
+}
+
+function childExecution(transaction: any): string | undefined {
+  const value = transaction?.txExecutionResultName
+    ?? transaction?.execution_result
+    ?? transaction?.txExecutionResult
+    ?? transaction?.consensus_data?.leader_receipt?.find((item: any) => item?.mode === "leader")?.execution_result;
+  return value === undefined ? undefined : typeof value === "string" ? value : "UNVERIFIABLE";
+}
+
+function servicesFromReadClient(): PayoutDeliveryServices {
+  return {
+    getTriggeredTransactionIds: async parentHash => (await readClient.getTriggeredTransactionIds({hash: parentHash as any})) as string[],
+    getTransaction: async hash => readClient.getTransaction({hash: hash as any}),
+  };
+}
+
+/**
+ * Verifies delivery only from child transactions explicitly triggered by `parentHash`.
+ * It deliberately treats incomplete or ambiguous receipts as non-delivery.
+ */
+export async function verifyTriggeredPayoutDelivery(parentHash: string, recipient: string, amount: bigint, services: PayoutDeliveryServices = servicesFromReadClient()): Promise<PayoutDelivery> {
+  const expectedRecipient = canonicalAddress(recipient);
+  const canonicalParentHash = canonicalTransactionHash(parentHash);
+  if (!canonicalParentHash) {
+    return {state: "PENDING_OR_UNVERIFIED", reason: "MALFORMED_PARENT", parentHash};
+  }
+  parentHash = canonicalParentHash;
+  if (!expectedRecipient || amount < 0n) {
+    return {state: "PENDING_OR_UNVERIFIED", reason: "MALFORMED_CHILD", parentHash};
+  }
+
+  let parent: any;
+  try { parent = await services.getTransaction(parentHash); }
+  catch { return {state: "PENDING_OR_UNVERIFIED", reason: "PARENT_EXECUTION_UNVERIFIED", parentHash}; }
+  if (!parent || childStatus(parent) !== "FINALIZED") {
+    return {state: "PENDING_OR_UNVERIFIED", reason: "PARENT_NOT_FINALIZED", parentHash};
+  }
+  const parentExecution = childExecution(parent);
+  if (!parentExecution || parentExecution === "UNVERIFIABLE") {
+    return {state: "PENDING_OR_UNVERIFIED", reason: "PARENT_EXECUTION_UNVERIFIED", parentHash};
+  }
+  if (parentExecution !== ExecutionResult.FINISHED_WITH_RETURN && parentExecution !== "SUCCESS") {
+    return {state: "FAILED_OR_UNCREDITED", reason: "PARENT_EXECUTION_FAILED", parentHash};
+  }
+
+  const ids = await services.getTriggeredTransactionIds(parentHash);
+  if (!Array.isArray(ids) || ids.length === 0 || ids.some(id => typeof id !== "string") || new Set(ids.map(id => id.toLowerCase())).size !== ids.length) {
+    return {state: "PENDING_OR_UNVERIFIED", reason: "NO_TRIGGERED_CHILD", parentHash};
+  }
+
+  const children = await Promise.all(ids.map(async hash => ({hash, transaction: await services.getTransaction(hash)})));
+  const candidates = children.filter(({transaction}) => childRecipient(transaction) === expectedRecipient && childValue(transaction) === amount);
+  if (candidates.length === 0) return {state: "PENDING_OR_UNVERIFIED", reason: "NO_MATCHING_CHILD", parentHash};
+  if (candidates.length !== 1) return {state: "PENDING_OR_UNVERIFIED", reason: "AMBIGUOUS_MATCHING_CHILD", parentHash};
+
+  const candidate = candidates[0];
+  const transaction: any = candidate.transaction;
+  const recipientValue = childRecipient(transaction);
+  const amountValue = childValue(transaction);
+  if (!recipientValue || amountValue === undefined) return {state: "PENDING_OR_UNVERIFIED", reason: "MALFORMED_CHILD", parentHash, childHash: candidate.hash, transaction: candidate.transaction};
+  if (childStatus(transaction) !== "FINALIZED") return {state: "PENDING_OR_UNVERIFIED", reason: "CHILD_NOT_FINALIZED", parentHash, childHash: candidate.hash, transaction: candidate.transaction};
+
+  const execution = childExecution(transaction);
+  if (execution && execution !== ExecutionResult.FINISHED_WITH_RETURN && execution !== "SUCCESS") {
+    return {state: "FAILED_OR_UNCREDITED", reason: "CHILD_EXECUTION_FAILED", parentHash, childHash: candidate.hash, transaction: candidate.transaction};
+  }
+  if (transaction?.value_credited === false) {
+    return {state: "FAILED_OR_UNCREDITED", reason: "VALUE_NOT_CREDITED", parentHash, childHash: candidate.hash, transaction: candidate.transaction};
+  }
+  if (transaction?.value_credited !== true) {
+    return {state: "PENDING_OR_UNVERIFIED", reason: "VALUE_CREDIT_UNVERIFIED", parentHash, childHash: candidate.hash, transaction: candidate.transaction};
+  }
+  return {state: "CONFIRMED", reason: "DELIVERY_CONFIRMED", parentHash, childHash: candidate.hash, transaction: candidate.transaction};
+}
+
 export class TransactionOutcomeError extends Error {
   constructor(public readonly stage: TxStage, message: string) { super(message); this.name = "TransactionOutcomeError"; }
 }
