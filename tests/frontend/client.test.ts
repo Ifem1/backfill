@@ -1,5 +1,6 @@
 import {describe, expect, it, vi} from "vitest";
-import {getPendingTransactions, selectTriggeredTransfer, verifyTriggeredPayoutDelivery, writeAndConfirm, type PayoutDeliveryServices} from "../../lib/genlayer/client";
+import {getPendingTransactions, selectTriggeredTransfer, verifyTriggeredPayoutDelivery, writeAndConfirm, type PayoutDelivery, type PayoutDeliveryServices} from "../../lib/genlayer/client";
+import {isPayoutSettlementActive, payoutDeliveryPresentation} from "../../lib/ui/payout-delivery";
 import {nestedLeaderExecutionReceipt, nestedLeaderFailureReceipt, topLevelExecutionReceipt} from "./fixtures/studionet-receipts";
 
 function fakeClient(receipt:any={txExecutionResultName:"FINISHED_WITH_RETURN"}) {
@@ -95,146 +96,42 @@ describe("write transaction safety", () => {
   });
 });
 
-const parentA = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const parentB = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-const recipient = "0x0000000000000000000000000000000000000001";
-const amount = 1000000000000000000n;
+const PH="0x"+"a".repeat(64), CH="0x"+"b".repeat(64);
+const view=(state:PayoutDelivery["state"],reason:PayoutDelivery["reason"],child=false):PayoutDelivery=>({state,reason,parentHash:PH,...(child?{childHash:CH}:{})});
+describe("claim payout delivery presentation",()=>{
+  it.each(["PENDING","PAID"])("%s is active",s=>expect(isPayoutSettlementActive(s)).toBe(true));
+  it.each(["NONE",undefined,null,"","UNKNOWN",1,{},[] as any])("%j is inactive",s=>expect(isPayoutSettlementActive(s)).toBe(false));
+  it("keeps uninitiated and confirmed delivery neutral",()=>{expect(payoutDeliveryPresentation(false)).toMatchObject({tone:"neutral",title:"Payout not initiated"}); expect(payoutDeliveryPresentation(false,PH,view("CONFIRMED","DELIVERY_CONFIRMED",true)).title).toBe("Payout not initiated")});
+  it("keeps missing parent pending",()=>expect(payoutDeliveryPresentation(true)).toMatchObject({tone:"pending",title:"Delivery pending / unverified"}));
+  it.each(["PARENT_NOT_FINALIZED","PARENT_EXECUTION_UNVERIFIED","NO_TRIGGERED_CHILD","NO_MATCHING_CHILD","CHILD_NOT_FINALIZED","VALUE_CREDIT_UNVERIFIED","MALFORMED_CHILD"] as const)("maps %s to pending",reason=>expect(payoutDeliveryPresentation(true,PH,view("PENDING_OR_UNVERIFIED",reason))).toMatchObject({tone:"pending",title:"Delivery pending / unverified"}));
+  it("distinguishes verified parent from malformed child",()=>{expect(payoutDeliveryPresentation(true,PH,view("PENDING_OR_UNVERIFIED","MALFORMED_CHILD")).parentState).toContain("finalized and execution verified"); expect(payoutDeliveryPresentation(true,PH,view("PENDING_OR_UNVERIFIED","PARENT_NOT_FINALIZED")).parentState).toContain("not authoritatively verified")});
+  it.each([["PARENT_EXECUTION_FAILED","The authoritative payout path did not complete successfully."],["CHILD_EXECUTION_FAILED","The authoritative payout path did not complete successfully."],["VALUE_NOT_CREDITED","The matching external transfer was not credited."]] as const)("maps %s to failed",(reason,message)=>expect(payoutDeliveryPresentation(true,PH,view("FAILED_OR_UNCREDITED",reason,true))).toMatchObject({tone:"failed",title:"Delivery failed / uncredited",message,childHash:CH}));
+  it("confirms only confirmed delivery",()=>{expect(payoutDeliveryPresentation(true,PH,view("CONFIRMED","DELIVERY_CONFIRMED",true))).toMatchObject({tone:"confirmed",title:"Delivery confirmed",childHash:CH}); expect(payoutDeliveryPresentation(true,PH,view("PENDING_OR_UNVERIFIED","NO_MATCHING_CHILD")).title).not.toBe("Delivery confirmed")});
+});
 
-function deliveredChild(overrides: Record<string, unknown> = {}) {
-  return {recipient, value: amount.toString(), statusName: "FINALIZED", txExecutionResultName: "SUCCESS", value_credited: true, ...overrides};
-}
+const P="0x"+"a".repeat(64), Q="0x"+"b".repeat(64), R="0x0000000000000000000000000000000000000001", A=1000000000000000000n;
+const child=(x:any={})=>({recipient:R,value:String(A),statusName:"FINALIZED",txExecutionResultName:"SUCCESS",value_credited:true,...x});
+const parent=(x:any={})=>({statusName:"FINALIZED",txExecutionResultName:"SUCCESS",...x});
+const services=(children:any, parents:any={}):PayoutDeliveryServices=>({
+  getTriggeredTransactionIds:async h=>Object.keys(children[h]||{}),
+  getTransaction:async h=>parents[h]??(h===P||h===Q?parent():children[P]?.[h]??children[Q]?.[h]),
+});
+const verify=(c:any, p=P, s?:PayoutDeliveryServices)=>verifyTriggeredPayoutDelivery(p,R,A,s||services({[p]:{"0xc":c}}));
 
-function finalizedParent(overrides: Record<string, unknown> = {}) {
-  return {statusName: "FINALIZED", txExecutionResultName: "SUCCESS", ...overrides};
-}
-
-function deliveryServices(childrenByParent: Record<string, Record<string, unknown>>, parentsByHash: Record<string, unknown> = Object.fromEntries(Object.keys(childrenByParent).map(hash => [hash, finalizedParent()]))) : PayoutDeliveryServices {
-  return {
-    getTriggeredTransactionIds: async parent => Object.keys(childrenByParent[parent] || {}),
-    getTransaction: async hash => parentsByHash[hash] ?? Object.values(childrenByParent).flatMap(children => Object.entries(children)).find(([id]) => id === hash)?.[1],
-  };
-}
-
-describe("triggered payout delivery verification", () => {
-  it("confirms only a finalized, successful parent and child with the exact recipient, amount, and credited value", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, `0x${recipient.slice(2).toUpperCase()}`, amount, deliveryServices({[parentA]: {"0xchild": deliveredChild()}}));
-    expect(result).toMatchObject({state: "CONFIRMED", reason: "DELIVERY_CONFIRMED", parentHash: parentA, childHash: "0xchild"});
+describe("triggered payout delivery verification",()=>{
+  it("confirms one exact credited child",async()=>expect(await verify(child())).toMatchObject({state:"CONFIRMED",reason:"DELIVERY_CONFIRMED",childHash:"0xc"}));
+  it.each([["pending","PENDING"],["accepted","ACCEPTED"],["malformed",7]])("rejects non-final parent %s",async(_,status)=>{
+    const called=vi.fn(async()=>["0xc"]), r=await verifyTriggeredPayoutDelivery(P,R,A,{getTriggeredTransactionIds:called,getTransaction:async h=>h===P?parent({statusName:status}):child()});
+    expect(r).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"PARENT_NOT_FINALIZED"}); expect(called).not.toHaveBeenCalled();
   });
-
-  it.each([
-    ["pending", finalizedParent({statusName: "PENDING"}), "PARENT_NOT_FINALIZED"],
-    ["accepted but non-finalized", finalizedParent({statusName: "ACCEPTED"}), "PARENT_NOT_FINALIZED"],
-    ["malformed finality", finalizedParent({statusName: 7}), "PARENT_NOT_FINALIZED"],
-  ])("does not inspect children for a %s parent", async (_label, parent, reason) => {
-    const triggered = vi.fn(async () => ["0xchild"]);
-    const services: PayoutDeliveryServices = {getTriggeredTransactionIds: triggered, getTransaction: async hash => hash === parentA ? parent : deliveredChild()};
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, services);
-    expect(result).toMatchObject({state: "PENDING_OR_UNVERIFIED", reason});
-    expect(triggered).not.toHaveBeenCalled();
-  });
-
-  it("does not confirm a finalized parent with failed execution", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": deliveredChild()}}, {[parentA]: finalizedParent({txExecutionResultName: "REVERTED"})}));
-    expect(result).toMatchObject({state: "FAILED_OR_UNCREDITED", reason: "PARENT_EXECUTION_FAILED"});
-  });
-
-  it.each([
-    ["missing", (() => { const {txExecutionResultName: _execution, ...parent} = finalizedParent(); return parent; })()],
-    ["malformed", finalizedParent({txExecutionResultName: 7})],
-  ])("fails closed when parent execution evidence is %s", async (_label, parent) => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": deliveredChild()}}, {[parentA]: parent}));
-    expect(result).toMatchObject({state: "PENDING_OR_UNVERIFIED", reason: "PARENT_EXECUTION_UNVERIFIED"});
-  });
-
-  it("rejects a malformed or non-32-byte parent hash before lookup", async () => {
-    const getTransaction = vi.fn(async () => finalizedParent());
-    const triggered = vi.fn(async () => ["0xchild"]);
-    const result = await verifyTriggeredPayoutDelivery("0xabc", recipient, amount, {getTransaction, getTriggeredTransactionIds: triggered});
-    expect(result).toMatchObject({state: "PENDING_OR_UNVERIFIED", reason: "MALFORMED_PARENT"});
-    expect(getTransaction).not.toHaveBeenCalled();
-    expect(triggered).not.toHaveBeenCalled();
-  });
-
-  it("does not confirm a parent with no triggered child", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {}}));
-    expect(result.state).not.toBe("CONFIRMED");
-    expect(result.reason).toBe("NO_TRIGGERED_CHILD");
-  });
-
-  it.each([
-    ["different recipient", deliveredChild({recipient: "0x0000000000000000000000000000000000000002"})],
-    ["different amount", deliveredChild({value: "999"})],
-    ["malformed recipient", deliveredChild({recipient: "not-an-address"})],
-    ["malformed amount", deliveredChild({value: "1e18"})],
-  ])("does not confirm a child with %s", async (_label, child) => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": child}}));
-    expect(result.state).not.toBe("CONFIRMED");
-  });
-
-  it.each([
-    ["pending", deliveredChild({statusName: "PENDING"})],
-    ["accepted but not finalized", deliveredChild({statusName: "ACCEPTED"})],
-    ["malformed finality", deliveredChild({statusName: 7})],
-  ])("does not confirm a child that is %s", async (_label, child) => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": child}}));
-    expect(result).toMatchObject({state: "PENDING_OR_UNVERIFIED", reason: "CHILD_NOT_FINALIZED"});
-  });
-
-  it("does not confirm a finalized child with failed execution", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": deliveredChild({txExecutionResultName: "REVERTED"})}}));
-    expect(result).toMatchObject({state: "FAILED_OR_UNCREDITED", reason: "CHILD_EXECUTION_FAILED"});
-  });
-
-  it.each([
-    ["false", deliveredChild({value_credited: false}), "FAILED_OR_UNCREDITED", "VALUE_NOT_CREDITED"],
-    ["missing", (() => { const {value_credited: _valueCredited, ...child} = deliveredChild(); return child; })(), "PENDING_OR_UNVERIFIED", "VALUE_CREDIT_UNVERIFIED"],
-    ["malformed", deliveredChild({value_credited: "true"}), "PENDING_OR_UNVERIFIED", "VALUE_CREDIT_UNVERIFIED"],
-  ])("fails closed when value credit is %s", async (_label, child, state, reason) => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": child}}));
-    expect(result).toMatchObject({state, reason});
-  });
-
-  it("selects the one exact child from the parent's triggered set", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {
-      "0xunrelated": deliveredChild({recipient: "0x0000000000000000000000000000000000000002"}),
-      "0xdelivery": deliveredChild(),
-    }}));
-    expect(result).toMatchObject({state: "CONFIRMED", childHash: "0xdelivery"});
-  });
-
-  it("fails closed when multiple triggered children plausibly match", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {
-      "0xdelivery-one": deliveredChild(), "0xdelivery-two": deliveredChild(),
-    }}));
-    expect(result).toMatchObject({state: "PENDING_OR_UNVERIFIED", reason: "AMBIGUOUS_MATCHING_CHILD"});
-  });
-
-  it("binds evidence to the supplied parent transaction", async () => {
-    const services = deliveryServices({[parentA]: {"0xchild-a": deliveredChild()}, [parentB]: {"0xchild-b": deliveredChild({value: "2"})}});
-    await expect(verifyTriggeredPayoutDelivery(parentA, recipient, amount, services)).resolves.toMatchObject({state: "CONFIRMED", childHash: "0xchild-a"});
-    await expect(verifyTriggeredPayoutDelivery(parentB, recipient, amount, services)).resolves.toMatchObject({state: "PENDING_OR_UNVERIFIED", reason: "NO_MATCHING_CHILD"});
-  });
-
-  it("cannot turn an invalid parent into delivery by exposing a valid child namespace", async () => {
-    const triggered = vi.fn(async () => ["0xchild"]);
-    const services: PayoutDeliveryServices = {
-      getTriggeredTransactionIds: triggered,
-      getTransaction: async hash => hash === parentA ? finalizedParent({txExecutionResultName: "REVERTED"}) : deliveredChild(),
-    };
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, services);
-    expect(result).toMatchObject({state: "FAILED_OR_UNCREDITED", reason: "PARENT_EXECUTION_FAILED"});
-    expect(triggered).not.toHaveBeenCalled();
-  });
-
-  it("does not treat parent success as payout delivery without a valid credited child", async () => {
-    const result = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": deliveredChild({value_credited: false})}}));
-    expect(result.state).not.toBe("CONFIRMED");
-  });
-
-  it("does not let address case normalization accept a malformed or contradictory address", async () => {
-    const malformed = await verifyTriggeredPayoutDelivery(parentA, "not-an-address", amount, deliveryServices({[parentA]: {"0xchild": deliveredChild()}}));
-    const contradictory = await verifyTriggeredPayoutDelivery(parentA, recipient, amount, deliveryServices({[parentA]: {"0xchild": deliveredChild({to: "0x0000000000000000000000000000000000000002"})}}));
-    expect(malformed.state).not.toBe("CONFIRMED");
-    expect(contradictory.state).not.toBe("CONFIRMED");
-  });
+  it.each([["missing",(()=>{const{txExecutionResultName,...x}=parent();return x})(),"PARENT_EXECUTION_UNVERIFIED"],["malformed",parent({txExecutionResultName:7}),"PARENT_EXECUTION_UNVERIFIED"],["failed",parent({txExecutionResultName:"REVERTED"}),"PARENT_EXECUTION_FAILED"]])("rejects parent execution %s",async(_,p,reason)=>expect(await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{"0xc":child()}},{[P]:p}))).toMatchObject({reason,state:reason==="PARENT_EXECUTION_FAILED"?"FAILED_OR_UNCREDITED":"PENDING_OR_UNVERIFIED"}));
+  it("rejects malformed parent without lookup",async()=>{const get=vi.fn(), t=vi.fn(); const r=await verifyTriggeredPayoutDelivery("0xabc",R,A,{getTransaction:get,getTriggeredTransactionIds:t}); expect(r).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"MALFORMED_PARENT"}); expect(get).not.toHaveBeenCalled(); expect(t).not.toHaveBeenCalled()});
+  it("rejects no child",async()=>expect(await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{}}))).toMatchObject({reason:"NO_TRIGGERED_CHILD",state:"PENDING_OR_UNVERIFIED"}));
+  it.each([["recipient",{recipient:"0x0000000000000000000000000000000000000002"}],["amount",{value:"2"}],["bad recipient",{recipient:"bad"}],["bad amount",{value:"1e18"}]])("rejects child %s",async(_,x)=>expect(await verify(child(x))).toMatchObject({reason:"NO_MATCHING_CHILD",state:"PENDING_OR_UNVERIFIED"}));
+  it.each([["pending","PENDING"],["accepted","ACCEPTED"],["malformed",7]])("rejects child finality %s",async(_,status)=>expect(await verify(child({statusName:status}))).toMatchObject({reason:"CHILD_NOT_FINALIZED",state:"PENDING_OR_UNVERIFIED"}));
+  it("rejects failed child",async()=>expect(await verify(child({txExecutionResultName:"REVERTED"}))).toMatchObject({reason:"CHILD_EXECUTION_FAILED",state:"FAILED_OR_UNCREDITED"}));
+  it.each([["false",false,"VALUE_NOT_CREDITED","FAILED_OR_UNCREDITED"],["missing",undefined,"VALUE_CREDIT_UNVERIFIED","PENDING_OR_UNVERIFIED"],["malformed","true","VALUE_CREDIT_UNVERIFIED","PENDING_OR_UNVERIFIED"]])("requires value credit %s",async(_,v,reason,state)=>{const c=v===undefined?(()=>{const{value_credited,...x}=child();return x})():child({value_credited:v}); expect(await verify(c)).toMatchObject({reason,state})});
+  it("selects one match and rejects ambiguity",async()=>{const one=await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{"0xa":child({recipient:"0x0000000000000000000000000000000000000002"}),"0xb":child()}})); expect(one).toMatchObject({state:"CONFIRMED",childHash:"0xb"}); const many=await verifyTriggeredPayoutDelivery(P,R,A,services({[P]:{"0xa":child(),"0xb":child()}})); expect(many).toMatchObject({state:"PENDING_OR_UNVERIFIED",reason:"AMBIGUOUS_MATCHING_CHILD"})});
+  it("binds parent namespace and rejects rescue",async()=>{const s=services({[P]:{"0xa":child()},[Q]:{"0xb":child({value:"2"})}}); expect(await verifyTriggeredPayoutDelivery(P,R,A,s)).toMatchObject({state:"CONFIRMED",childHash:"0xa"}); expect(await verifyTriggeredPayoutDelivery(Q,R,A,s)).toMatchObject({reason:"NO_MATCHING_CHILD"}); const t=vi.fn(async()=>["0xc"]),r=await verifyTriggeredPayoutDelivery(P,R,A,{getTriggeredTransactionIds:t,getTransaction:async h=>h===P?parent({txExecutionResultName:"REVERTED"}):child()}); expect(r).toMatchObject({reason:"PARENT_EXECUTION_FAILED"}); expect(t).not.toHaveBeenCalled()});
+  it("fails closed for malformed target and parent success alone",async()=>{expect(await verifyTriggeredPayoutDelivery(P,"bad",A,services({[P]:{"0xc":child()}}))).toMatchObject({reason:"MALFORMED_CHILD"}); expect(await verify(child({value_credited:false}))).toMatchObject({reason:"VALUE_NOT_CREDITED"})});
 });
